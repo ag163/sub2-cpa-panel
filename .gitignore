@@ -1,0 +1,18 @@
+__pycache__/
+panel-ui/node_modules/
+panel-ui/.vite/
+panel-dist/
+panel-server.log
+panel-server.err.log
+lt.log
+lt.err.log
+*.pyc
+*.zip
+
+# Generated or sensitive local data
+cpa-import/
+sample-sub2api-export.json
+ui-cleaned-preview.png
+
+# Temporary deployment helpers
+panel-dist-upload.zip
