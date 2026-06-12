@@ -1,7 +1,6 @@
 __pycache__/
 panel-ui/node_modules/
 panel-ui/.vite/
-panel-dist/
 panel-server.log
 panel-server.err.log
 lt.log

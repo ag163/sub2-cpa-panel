@@ -31,7 +31,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "cpa-import"
 DEFAULT_CLI_PROXY_URL = "http://127.0.0.1:8317"
 PANEL_DIST_DIR = SCRIPT_DIR / "panel-dist"
-USE_PANEL_DIST = os.environ.get("SUB2_CPA_USE_PANEL_DIST") == "1"
+USE_PANEL_DIST = os.environ.get("SUB2_CPA_USE_PANEL_DIST", "1") != "0"
 
 
 INDEX_HTML = r'''<!doctype html>
@@ -839,9 +839,6 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def maybe_send_panel_asset(self, request_path: str) -> bool:
-        # 默认不要加载 panel-dist。线上 GitHub Pages 使用 docs/ 静态产物；
-        # 本地 Python 面板必须走内置的后端版 UI，否则“转换并导入到 CLIProxyAPI”
-        # 会被静态托管版的浏览器安全限制拦截，无法访问本机 127.0.0.1。
         if not USE_PANEL_DIST or not PANEL_DIST_DIR.is_dir():
             return False
         if request_path in {"/", "/index.html"}:

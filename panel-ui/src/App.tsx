@@ -1,11 +1,11 @@
-import { useMemo, useState, type ReactNode } from "react"
+import { useEffect, useMemo, useState, type ReactNode } from "react"
 import {
   AlertTriangle,
   Bot,
   Box,
   CheckCircle2,
-  Download,
   FileJson,
+  FolderOpen,
   KeyRound,
   Loader2,
   RefreshCw,
@@ -14,52 +14,75 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
-import {
-  ConversionError,
-  type ConvertSummary,
-  convertExportBrowser,
-  downloadArtifactsAsZip,
-  buildPackageFilename,
-  importFilesToCliProxyApiBrowser,
-  normalizeCliProxyUrl,
-  parseExportJson,
-  previewExport,
-  type PreviewResponse,
-  type Provider,
-  type GeneratedArtifact,
-} from "@/lib/converter"
 
-const DEFAULT_OUTPUT_DIR = "cpa-import"
+type Provider = "codex" | "claude" | string
 
-function isLocalOrPrivateHost(hostname: string) {
-  const normalized = hostname.toLowerCase()
-  if (normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1") {
-    return true
-  }
-  if (/^10\./.test(normalized)) {
-    return true
-  }
-  if (/^192\.168\./.test(normalized)) {
-    return true
-  }
-  const match172 = /^172\.(\d{1,3})\./.exec(normalized)
-  if (match172) {
-    const second = Number(match172[1])
-    if (second >= 16 && second <= 31) {
-      return true
-    }
-  }
-  return false
+type PreviewItem = {
+  index: number
+  provider: Provider
+  name: string
+  platform?: string
+  type?: string
 }
 
-async function toErrorMessage(error: unknown): Promise<string> {
-  if (error instanceof ConversionError || error instanceof Error) {
-    return error.message
+type PreviewResponse = {
+  ok: boolean
+  filename: string
+  count: number
+  providerCounts: Record<string, number>
+  items: PreviewItem[]
+}
+
+type SummaryItem = {
+  index: number
+  provider: Provider
+  detected_provider: Provider
+  email: string
+  filename: string
+  path: string
+  warnings?: string[]
+}
+
+type ConvertSummary = {
+  output_dir: string
+  provider_counts: Record<string, number>
+  written_count: number
+  items: SummaryItem[]
+  warnings?: string[]
+  errors?: string[]
+  cli_proxy_import?: {
+    ok: boolean
+    uploaded?: number
+    url?: string
+    error?: string
   }
-  return String(error)
+}
+
+type ConfigResponse = {
+  defaultOutputDir: string
+  defaultCliProxyUrl: string
+}
+
+async function postJson<T>(url: string, payload: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+  const data = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: string }
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.error || `请求失败：${response.status}`)
+  }
+  return data as T
 }
 
 function ProviderPill({ provider }: { provider: Provider }) {
@@ -142,21 +165,18 @@ function EmptyResult() {
 export default function App() {
   const [filename, setFilename] = useState("")
   const [content, setContent] = useState("")
-  const [outputDir, setOutputDir] = useState(DEFAULT_OUTPUT_DIR)
+  const [outputDir, setOutputDir] = useState("")
   const [tzOffset, setTzOffset] = useState("+08:00")
   const [provider, setProvider] = useState("auto")
   const [writeSummary, setWriteSummary] = useState("true")
-  const [cliProxyUrl, setCliProxyUrl] = useState("")
+  const [cliProxyUrl, setCliProxyUrl] = useState("http://127.0.0.1:8317")
   const [managementKey, setManagementKey] = useState("")
   const [preview, setPreview] = useState<PreviewResponse | null>(null)
   const [summary, setSummary] = useState<ConvertSummary | null>(null)
-  const [artifacts, setArtifacts] = useState<GeneratedArtifact[]>([])
   const [message, setMessage] = useState("")
   const [busy, setBusy] = useState<"convert" | "import" | "">("")
 
   const canConvert = Boolean(content) && !busy
-  const canDownload = Boolean(artifacts.length) && !busy
-
   const counts = useMemo(
     () => ({
       all: preview?.count || 0,
@@ -166,19 +186,24 @@ export default function App() {
     [preview]
   )
 
+  useEffect(() => {
+    fetch("/api/config")
+      .then((response) => response.json())
+      .then((config: ConfigResponse) => {
+        setOutputDir(config.defaultOutputDir || "")
+        setCliProxyUrl(config.defaultCliProxyUrl || "http://127.0.0.1:8317")
+      })
+      .catch((error) => setMessage(`读取默认配置失败：${error.message}`))
+  }, [])
+
   async function previewContent(nextFilename: string, nextContent: string) {
-    try {
-      setMessage("")
-      setSummary(null)
-      setArtifacts([])
-      const raw = parseExportJson(nextContent)
-      setPreview(previewExport(raw, nextFilename))
-    } catch (error) {
-      setPreview(null)
-      setSummary(null)
-      setArtifacts([])
-      setMessage(await toErrorMessage(error))
-    }
+    setMessage("")
+    setSummary(null)
+    const data = await postJson<PreviewResponse>("/api/preview", {
+      filename: nextFilename,
+      content: nextContent,
+    })
+    setPreview(data)
   }
 
   async function handleFile(file?: File) {
@@ -189,75 +214,40 @@ export default function App() {
     await previewContent(file.name, text)
   }
 
-  function downloadPackage(nextArtifacts: GeneratedArtifact[] = artifacts) {
-    downloadArtifactsAsZip(nextArtifacts, buildPackageFilename(filename))
-  }
-
   async function convert(importAfter = false) {
     if (!content) return
     if (importAfter && !managementKey.trim()) {
-      setMessage("直连导入到 CLIProxyAPI 需要填写 Management Key。")
+      setMessage("导入到 CLIProxyAPI 需要填写 Management Key。它是管理面板登录密钥，不是普通 API Key。")
       return
     }
     setBusy(importAfter ? "import" : "convert")
     setMessage("")
     try {
-      const raw = parseExportJson(content)
-      const result = convertExportBrowser(raw, {
+      const data = await postJson<{ ok: boolean; summary: ConvertSummary }>("/api/convert", {
+        filename,
+        content,
         outputDir,
         provider,
         tzOffset: tzOffset || "+08:00",
-        inputLabel: filename || "uploaded.json",
         writeSummary: writeSummary === "true",
+        importToCliProxyAPI: importAfter,
+        cliProxyUrl: cliProxyUrl || "http://127.0.0.1:8317",
+        managementKey,
       })
-
-      const nextSummary = result.summary
-      setSummary(nextSummary)
-      setArtifacts(result.artifacts)
-
-      if (importAfter) {
-        const baseUrl = normalizeCliProxyUrl(cliProxyUrl)
-        const parsed = new URL(baseUrl)
-        if (window.location.protocol === "https:" && parsed.protocol !== "https:") {
-          throw new ConversionError(
-            "当前托管页面运行在 HTTPS 下，浏览器会拦截访问 HTTP 的 CLIProxyAPI。请改成 HTTPS 公网地址，或先下载 ZIP 手动导入。"
-          )
-        }
-        if (isLocalOrPrivateHost(parsed.hostname)) {
-          throw new ConversionError(
-            "线上托管版无法直接访问你本机/局域网的 CLIProxyAPI。请先下载 ZIP 手动导入，或提供一个已开启 CORS 的公网 HTTPS CLIProxyAPI 地址。"
-          )
-        }
-
-        try {
-          nextSummary.cli_proxy_import = await importFilesToCliProxyApiBrowser(result.accountArtifacts, {
-            cliProxyUrl: baseUrl,
-            managementKey,
-          })
-        } catch (error) {
-          nextSummary.cli_proxy_import = {
-            ok: false,
-            error: await toErrorMessage(error),
-            url: baseUrl,
-          }
-        }
-        setSummary({ ...nextSummary })
-      }
+      setSummary(data.summary)
     } catch (error) {
-      setMessage(await toErrorMessage(error))
+      setMessage(error instanceof Error ? error.message : String(error))
     } finally {
       setBusy("")
     }
   }
 
-  function restoreDefaults() {
-    setOutputDir(DEFAULT_OUTPUT_DIR)
-    setTzOffset("+08:00")
-    setProvider("auto")
-    setWriteSummary("true")
-    setCliProxyUrl("")
-    setManagementKey("")
-    setMessage("")
+  async function openFolder() {
+    try {
+      await postJson("/api/open-folder", { path: outputDir })
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error))
+    }
   }
 
   return (
@@ -268,11 +258,11 @@ export default function App() {
             <h1 className="text-3xl font-black tracking-tight text-slate-950 sm:text-4xl">Sub2 → CLIProxyAPI</h1>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button className="h-10 rounded-xl" disabled={!canDownload} onClick={() => downloadPackage()} variant="outline">
-              <Download className="size-4" /> 下载 ZIP
+            <Button className="h-10 rounded-xl" onClick={openFolder} variant="outline">
+              <FolderOpen className="size-4" /> 打开输出目录
             </Button>
-            <Button className="h-10 rounded-xl" onClick={restoreDefaults} variant="outline">
-              <RefreshCw className="size-4" /> 恢复默认值
+            <Button className="h-10 rounded-xl" onClick={() => window.location.reload()} variant="outline">
+              <RefreshCw className="size-4" /> 刷新默认路径
             </Button>
           </div>
         </header>
@@ -282,7 +272,7 @@ export default function App() {
             <Card className="shadow-xl shadow-slate-900/5">
               <CardHeader>
                 <CardTitle className="text-xl font-bold">1. 选择导出文件</CardTitle>
-                <CardDescription>选择 Sub2API 的 account export JSON。整个转换都在浏览器本地完成，不会上传到本站。</CardDescription>
+                <CardDescription>选择 Sub2API 的 account export JSON。界面只展示邮箱、类型和警告，不展示 token。</CardDescription>
               </CardHeader>
               <CardContent>
                 <label
@@ -302,7 +292,7 @@ export default function App() {
                   <div>
                     <FileJson className="mx-auto mb-2 size-7 text-blue-600" />
                     <div className="text-base font-bold text-slate-950">{filename || "点击选择 sub2api-account-*.json"}</div>
-                    <div className="mt-2 text-sm text-slate-500">也可以直接拖到这里。转换完成后会生成可下载 ZIP。</div>
+                    <div className="mt-2 text-sm text-slate-500">也可以直接拖到这里。文件内容只发给本机 127.0.0.1 后端转换。</div>
                   </div>
                 </label>
               </CardContent>
@@ -311,12 +301,12 @@ export default function App() {
             <Card className="shadow-xl shadow-slate-900/5">
               <CardHeader>
                 <CardTitle className="text-xl font-bold">2. 转换设置</CardTitle>
-                <CardDescription>线上托管版不再写本地文件夹；会把生成结果打包成 ZIP 下载。</CardDescription>
+                <CardDescription>推荐保持自动识别；如果只处理 Claude 文件，可强制选择 Claude。</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4">
                 <div className="grid gap-3 sm:grid-cols-[1fr_192px]">
                   <label className="grid gap-2">
-                    <FieldLabel>压缩包内目录名</FieldLabel>
+                    <FieldLabel>输出目录</FieldLabel>
                     <Input className="h-10 rounded-xl" onChange={(event) => setOutputDir(event.currentTarget.value)} value={outputDir} />
                   </label>
                   <label className="grid gap-2">
@@ -345,13 +335,8 @@ export default function App() {
 
                 <div className="grid gap-3 sm:grid-cols-2">
                   <label className="grid gap-2">
-                    <FieldLabel>公网 CLIProxyAPI 地址</FieldLabel>
-                    <Input
-                      className="h-10 rounded-xl"
-                      onChange={(event) => setCliProxyUrl(event.currentTarget.value)}
-                      placeholder="仅直连公网 HTTPS 地址时填写"
-                      value={cliProxyUrl}
-                    />
+                    <FieldLabel>CLIProxyAPI 地址</FieldLabel>
+                    <Input className="h-10 rounded-xl" onChange={(event) => setCliProxyUrl(event.currentTarget.value)} value={cliProxyUrl} />
                   </label>
                   <label className="grid gap-2">
                     <FieldLabel>Management Key</FieldLabel>
@@ -360,7 +345,7 @@ export default function App() {
                       <Input
                         className="h-10 rounded-xl pl-9"
                         onChange={(event) => setManagementKey(event.currentTarget.value)}
-                        placeholder="尝试公网直连导入时填写"
+                        placeholder="导入按钮需要填写"
                         type="password"
                         value={managementKey}
                       />
@@ -368,24 +353,22 @@ export default function App() {
                   </label>
                 </div>
 
-                <StatusCallout>
-                  托管版默认流程是“浏览器本地转换 → 下载 ZIP”。如果你的 CLIProxyAPI 只是本机 `127.0.0.1` 或局域网地址，浏览器会拦截公网页面直连，请下载后手动导入。
-                </StatusCallout>
+                <p className="text-sm leading-6 text-slate-500">
+                  “导入到 CLIProxyAPI”会调用 <b className="text-slate-800">/v0/management/auth-files</b> 上传生成的 JSON；这里要填管理面板登录用的 Management Key。
+                </p>
 
                 {message ? <StatusCallout tone="error">{message}</StatusCallout> : null}
 
-                <div className="grid gap-2 sm:grid-cols-[minmax(160px,240px)_minmax(220px,1fr)_auto]">
+                <div className="grid gap-2 sm:grid-cols-[minmax(160px,280px)_minmax(240px,1fr)_auto]">
                   <Button className="h-12 rounded-xl text-base" disabled={!canConvert} onClick={() => void convert(false)}>
                     {busy === "convert" ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
                     开始转换
                   </Button>
                   <Button className="h-12 rounded-xl text-base" disabled={!canConvert} onClick={() => void convert(true)} variant="outline">
                     {busy === "import" ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
-                    尝试直连导入
+                    转换并导入到 CLIProxyAPI
                   </Button>
-                  <Button className="h-12 rounded-xl" disabled={!canDownload} onClick={() => downloadPackage()} variant="outline">
-                    下载 ZIP
-                  </Button>
+                  <Button className="h-12 rounded-xl" onClick={openFolder} variant="outline">打开目录</Button>
                 </div>
               </CardContent>
             </Card>
@@ -436,7 +419,7 @@ export default function App() {
             <Card className="shadow-xl shadow-slate-900/5">
               <CardHeader>
                 <CardTitle className="text-xl font-bold">结果</CardTitle>
-                <CardDescription>{summary ? `已生成 ${summary.written_count} 个文件` : "转换后会显示文件名、警告，并可下载 ZIP。"}</CardDescription>
+                <CardDescription>{summary ? `已生成 ${summary.written_count} 个文件` : "转换后会显示文件名、警告和导入状态。"}</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-3">
                 {!summary ? <EmptyResult /> : null}
@@ -444,13 +427,13 @@ export default function App() {
                 {summary?.cli_proxy_import ? (
                   <StatusCallout tone={summary.cli_proxy_import.ok ? "success" : "error"}>
                     {summary.cli_proxy_import.ok
-                      ? `已直连导入到 CLIProxyAPI：${summary.cli_proxy_import.uploaded || 0} 个文件 · ${summary.cli_proxy_import.url || ""}`
-                      : `直连导入失败：${summary.cli_proxy_import.error || "未知错误"}`}
+                      ? `已导入到 CLIProxyAPI：${summary.cli_proxy_import.uploaded || 0} 个文件 · ${summary.cli_proxy_import.url || ""}`
+                      : `导入 CLIProxyAPI 失败：${summary.cli_proxy_import.error || "未知错误"}`}
                   </StatusCallout>
                 ) : null}
 
                 {summary?.warnings?.length ? (
-                  <StatusCallout>共有 {summary.warnings.length} 条警告；Claude 缺少 user:profile 时，额度页失败但推理通常可用。</StatusCallout>
+                  <StatusCallout>共有 {summary.warnings.length} 条警告；Claude 缺少 user:profile 时，额度页失败但推理可用。</StatusCallout>
                 ) : null}
 
                 {summary?.errors?.length ? <StatusCallout tone="error">{summary.errors.join("；")}</StatusCallout> : null}
